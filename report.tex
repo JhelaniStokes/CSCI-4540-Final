@@ -1,0 +1,330 @@
+\documentclass[11pt]{article}
+
+\usepackage{times}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{parskip}
+\usepackage{setspace}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+\title{\textbf{Network Flow Forensics with Machine Learning}\\
+       \large CSCI 4540 --- Final Project Option \#2}
+\author{Jhelani Stokes}
+\date{April 27, 2026}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+% ────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+
+This project applies supervised machine learning
+to a dataset of 2,500 network flow records, labelled as either \emph{benign} or
+\emph{malicious}, with the goal of building accurate classifiers and critically
+evaluating their forensic utility.
+
+This report is structured as follows: Section~\ref{sec:eda}
+describes the dataset and exploratory analysis; Section~\ref{sec:features}
+details feature engineering; Section~\ref{sec:models} covers model training;
+Section~\ref{sec:eval} presents evaluation results and cross-validation
+comparison; and Section~\ref{sec:forensics} discusses forensic implications and
+ethical concerns. All code is available at the GitHub repository linked in
+Section~\ref{sec:code}.
+
+% ────────────────────────────────────────────────────────────────────────────
+\section{Data Exploration and Preprocessing}
+\label{sec:eda}
+
+\subsection{Dataset Overview}
+
+The dataset contains 2,500 flow records with ten original features and one
+binary target variable (\texttt{is\_malicious}). Features cover four
+categories: temporal (\texttt{duration}), volumetric (\texttt{src\_bytes},
+\texttt{dst\_bytes}, \texttt{packet\_count}, \texttt{avg\_packet\_size},
+\texttt{flow\_rate}), reliability (\texttt{num\_failed\_connections}), and
+protocol type (one-hot encoded flags for TCP, UDP, and ICMP).
+
+No missing values were detected across any feature. Descriptive statistics
+reveal substantial right-skew in volumetric fields: \texttt{src\_bytes} has
+a mean of 2,192 bytes but a maximum of 78,420 bytes, indicating the presence
+of high-volume outlier flows. 
+
+\subsection{Class Distribution}
+
+Of the 2,500 records, 1,738 (69.5\%) are labelled benign and 762 (30.5\%)
+malicious. To account for this imbalance, all models were trained with \texttt{class\_weight="balanced"}, which more heavily penalizes the model for misclassifying rarer classes in the dataset.
+
+\subsection{Feature Correlation}
+
+A correlation heatmap (Appendix, Figure~\ref{fig:heatmap}) created with \texttt{pd.corr} highlights several interesting relationships between the input features and classification. The feature \texttt{packet\_count} shows the highest correlation with malicious traffic. This is not very surprising because a high packet count is observed when a network is being scanned. Between the three protocols ICMP had almost no correlation, TCP showed negative correlation meaning that TCP traffic was indicative of non-malicious activity, and UDP was moderately correlated with malicious activity.
+% ────────────────────────────────────────────────────────────────────────────
+\section{Feature Engineering}
+\label{sec:features}
+
+3 engineered features were added to the original ten:
+
+\begin{itemize}
+    \item \textbf{byte\_ratio} $= \text{src\_bytes}\,/\,(\text{dst\_bytes}+1)$:
+          Asymmetric upload/download ratios are potential indicators of malicious traffic.
+    \item \textbf{bytes\_per\_packet} $= (\text{src\_bytes}+\text{dst\_bytes})\,/\,(\text{packet\_count}+1)$:
+          Unusually small or large values can be a sign of network scans or anomalous bulk transfers.
+    \item \textbf{failure\_rate} $= \text{num\_failed\_connections}\,/\,(\text{packet\_count}+1)$:
+          Normalises raw failure counts relative to flow size.
+\end{itemize}
+
+After engineering, the feature matrix has 13 columns. All continuous features
+were also standardized inside a
+\texttt{scikit-learn} \texttt{Pipeline}.
+
+% ────────────────────────────────────────────────────────────────────────────
+\section{Model Training}
+\label{sec:models}
+
+Two classifiers were implemented, each wrapped in a \texttt{Pipeline}
+with a \texttt{StandardScaler} prefix:
+
+\begin{enumerate}
+    \item \textbf{Logistic Regression (LR)}: A linear baseline well-suited to
+          linearly separable high-dimensional problems.
+    \item \textbf{Random Forest (RF)}: An ensemble of 200 decision trees that
+          captures non-linear feature interactions and provides interpretable
+          feature importances.
+\end{enumerate}
+
+The dataset was split 80/20 into training (2,000 records) and test
+(500 records) sets using stratified sampling to preserve the class ratio.
+All random states were fixed at 42 for reproducibility.
+
+% ────────────────────────────────────────────────────────────────────────────
+\section{Evaluation and Model Comparison}
+\label{sec:eval}
+
+\subsection{Hold-Out Test Set Results}
+
+Rather than using the default 0.5 decision threshold, each model's threshold
+was tuned post-training under two strategies: (1) \textbf{F1-optimal} which
+maximise the malicious-class F1 score, and (2) \textbf{Min-FN} which maximise
+recall (drive false negatives to zero), then select the highest-precision
+threshold among all that achieve that recall.
+Tables~\ref{tab:test_f1} and~\ref{tab:test_minfn} report results for each
+strategy on the held-out test set ($n=500$).
+
+\begin{table}[H]
+\centering
+\caption{F1-optimal threshold --- hold-out test set (malicious class, $n=152$).}
+\label{tab:test_f1}
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Model} & \textbf{Threshold} & \textbf{Accuracy} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} \\
+\midrule
+Logistic Regression  & 0.384 & 0.9940 & 0.9869 & 0.9934 & 0.9902 \\
+Random Forest        & 0.704 & 0.9940 & 1.0000 & 0.9803 & 0.9900 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Min-FN threshold (zero false negatives) --- hold-out test set (malicious class, $n=152$).}
+\label{tab:test_minfn}
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Model} & \textbf{Threshold} & \textbf{Accuracy} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} \\
+\midrule
+Logistic Regression  & 0.192 & 0.9800 & 0.9383 & 1.0000 & 0.9682 \\
+Random Forest        & 0.281 & 0.9920 & 0.9744 & 1.0000 & 0.9870 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both models achieve near-identical F1 scores ($\approx 0.990$) under the
+F1-optimal strategy. Under the Min-FN strategy, both achieve perfect recall
+(zero false negatives) at the cost of increased false positives: LR flags 10
+benign flows as malicious versus 4 for RF. This makes RF the preferred choice
+as it eliminates missed detections while
+producing fewer false positive alerts than LR.
+
+\subsection{ROC Curves}
+
+The ROC curves (Appendix, Figure~\ref{fig:roc}) for both models are virtually
+indistinguishable, hugging the top-left corner. This shows that they are able to correctly identify malicious traffic without being overly sensitive and causing false positives.
+
+\subsection{Cross-Validation}
+
+Table~\ref{tab:cv} reports 5-fold stratified cross-validation results.
+Consistent with the hold-out evaluation, LR achieves the highest mean
+accuracy ($99.56\% \pm 0.34\%$) and lowest variance, making it both the most
+accurate and most stable classifier. Both models generalise well, with
+standard deviations below 0.5\% for accuracy, indicating minimal overfitting.
+
+\begin{table}[H]
+\centering
+\caption{5-fold stratified cross-validation summary (mean $\pm$ std).}
+\label{tab:cv}
+\begin{tabular}{lllll}
+\toprule
+\textbf{Model} & \textbf{Accuracy} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} \\
+\midrule
+Logistic Regression
+    & $0.9956\pm0.0034$ & $0.9935\pm0.0100$ & $0.9921\pm0.0064$ & $0.9928\pm0.0056$ \\
+Random Forest
+    & $0.9944\pm0.0039$ & $0.9935\pm0.0082$ & $0.9882\pm0.0113$ & $0.9908\pm0.0064$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Feature Importance}
+
+Random Forest feature importances (Appendix, Figure~\ref{fig:importance})
+identify \texttt{packet\_count}, \texttt{num\_failed\_connections}, and
+\texttt{failure\_rate} as the top three predictors by a wide margin (0.516,
+0.239, and 0.098 respectively). Engineered features (\texttt{failure\_rate},
+\texttt{bytes\_per\_packet}, \texttt{byte\_ratio}) appear among the top
+predictors, validating the feature engineering step. The protocol indicators
+(\texttt{protocol\_tcp}, \texttt{protocol\_udp}, \texttt{protocol\_icmp})
+rank at the bottom, suggesting that attack traffic in this dataset is
+protocol-agnostic and relies more on behavioural anomalies than
+protocol-specific exploitation.
+
+
+% ────────────────────────────────────────────────────────────────────────────
+\section{Forensic Implications and Ethical Concerns}
+\label{sec:forensics}
+
+\subsection{False Negatives in a Forensic Context}
+
+A false negative, a malicious flow classified as benign, is the more
+consequential error in digital forensics. Missed detections may
+allow attackers to persist undetected, potentially obscuring the full scope
+of a breach. Under the Min-FN
+threshold strategy, both models achieve zero false negatives on the test set,
+though this likely will not be the case in real-world scenarios.
+
+\subsection{False Positives and Alert Fatigue}
+
+False positives have the very real potential to cause analyst fatigue. If a security department is
+handling millions of flows per day, even a 1\% false-positive rate would
+generate thousands of alerts per hour. Under the F1-optimal threshold, the models produce 0--2 false positives per
+348 benign test records ($\approx 0\%$--$0.6\%$), which may be acceptable for
+a first-pass automated tool. Under the Min-FN threshold the rate
+rises to 4--10 false positives ($\approx 1.1\%$--$2.9\%$), which may be a worthwhile
+trade-off provided flagged flows are reviewed by a human analyst before any
+action is taken.
+
+\subsection{Ethical and Legal Concerns}
+
+\textbf{Privacy:} Network flow analysis reveals communication patterns between
+individuals and organisations. Aggregate flow metadata may expose
+sensitive behavioural information (medical service connections,
+political affiliations, etc.). Users of a model like this should ensure that data collection
+and storage comply with local privacy laws. 
+
+\textbf{Bias and Fairness:} Training data labelled by a malicious traffic detection model may systematically mis-label traffic from underrepresented network
+configurations or geographic regions. Models trained on such data may
+present bias, leading to a disproportionate scrutiny of
+certain users.
+
+
+% ────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+This project demonstrated that supervised machine learning applied to
+engineered network flow features can classify malicious traffic with
+exceptional accuracy. Both models achieved near-identical F1 scores of
+$\approx 0.990$ under the F1-optimal threshold, with Random Forest preferred
+in a forensic context due to its ability to eliminate false negatives while
+producing fewer false positives than Logistic Regression. Both models
+achieved near-identical performance in 5-fold cross-validation, confirming
+stable generalisation. The forensic analysis highlights that while the
+models are highly effective as automated triage tools, human oversight
+remains indispensable to contextualise predictions, manage false-positive
+burden, and ensure legally defensible conclusions.
+
+% ────────────────────────────────────────────────────────────────────────────
+\section{Code}
+\label{sec:code}
+
+All Python source code for data loading, feature engineering, model training,
+evaluation, and figure generation is available in the project repository:\\
+\url{https://github.com/jhelani-stokes/CSCI-4540-Final}
+
+% ────────────────────────────────────────────────────────────────────────────
+\clearpage
+\appendix
+\section{Visualizations and Evaluation Metrics}
+
+\begin{figure}[H]
+    \centering
+    \hfill
+    \begin{subfigure}[b]{0.85\textwidth}
+        \includegraphics[width=\textwidth]{figures/correlation_heatmap.png}
+        \caption{Pearson correlation heatmap.}
+        \label{fig:heatmap}
+    \end{subfigure}
+    \caption{Dataset overview.}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\textwidth]{figures/cm_logistic_regression_f1.png}
+        \caption{LR --- F1-optimal threshold.}
+        \label{fig:cm_lr_f1}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\textwidth]{figures/cm_logistic_regression_minfn.png}
+        \caption{LR --- Min-FN threshold.}
+        \label{fig:cm_lr_minfn}
+    \end{subfigure}
+    \vspace{0.5em}
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\textwidth]{figures/cm_random_forest_f1.png}
+        \caption{RF --- F1-optimal threshold.}
+        \label{fig:cm_rf_f1}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\textwidth]{figures/cm_random_forest_minfn.png}
+        \caption{RF --- Min-FN threshold.}
+        \label{fig:cm_rf_minfn}
+    \end{subfigure}
+    \caption{Confusion matrices on the hold-out test set under both threshold strategies.}
+    \label{fig:cms}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{figures/roc_curves.png}
+    \caption{ROC curves.}
+    \label{fig:roc}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{figures/cv_comparison.png}
+    \caption{5-fold cross-validation comparison (mean $\pm$ std).}
+    \label{fig:cv}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{figures/feature_importance.png}
+    \caption{Top 15 feature importances from the Random Forest classifier.}
+    \label{fig:importance}
+\end{figure}
+
+\end{document}
